@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 """
-Cloud Security Monitor - Windows Optimized Version
+Cloud Security Monitor - Kali Linux Optimized Version
 Author: Umidc
-Version: 3.5 (Stable Npcap Implementation)
+Version: 4.0 (Linux Raw Socket Implementation)
 """
 
 import os
@@ -20,56 +20,39 @@ from typing import List, Dict, Any, Optional
 
 # --- Configuration ---
 class Config:
-    LOG_FILE = "security.log"
+    LOG_FILE = "/var/log/security_monitor.log"
     API_HOST = "0.0.0.0"
     API_PORT = 8000
-    SNIFF_FILTER = "ip"  # Only monitor IP traffic
+    SNIFF_FILTER = "ip"  # BPF filter syntax
     THREAT_PORTS = {
         22: "SSH Brute Force",
-        3389: "RDP Brute Force",
-        445: "SMB Exploit Attempt",
-        1433: "SQL Server Bruteforce"
+        21: "FTP Exploit Attempt",
+        23: "Telnet Attack",
+        3389: "RDP Bruteforce",
+        445: "SMB Exploit",
+        1433: "SQL Injection Attempt",
+        3306: "MySQL Attack"
     }
-    MAX_THREATS = 1000  # Maximum threats to keep in memory
+    MAX_THREATS = 2000  # Maximum threats to keep in memory
+    INTERFACE = "eth0"  # Default monitoring interface
 
-# --- Windows Initialization ---
-if platform.system() == 'Windows':
-    import ctypes
-    try:
-        import scapy.all as scapy
-        from scapy.config import conf
-        
-        # Configure Scapy for Windows
-        conf.use_pcap = True
-        if not hasattr(scapy.arch.windows, 'L3WinSocket'):
-            # Fallback to raw sockets if Npcap not properly installed
-            conf.L3socket = scapy.L3RawSocket
-        else:
-            from scapy.arch.windows import L3WinSocket
-            conf.L3socket = L3WinSocket
-
-        # Admin check
-        if not ctypes.windll.shell32.IsUserAnAdmin():
-            ctypes.windll.user32.MessageBoxW(0, 
-                "Please run as Administrator!", 
-                "Permission Error", 0x10)
-            sys.exit(1)
-
-    except ImportError as e:
-        print(f"Critical Scapy import error: {e}")
-        print("Please install: pip install scapy==2.4.5")
+# --- Linux Privilege Check ---
+if platform.system() == 'Linux':
+    if os.geteuid() != 0:
+        print("ERROR: This application requires root privileges!", file=sys.stderr)
         sys.exit(1)
 
 # --- Logging Setup ---
 def setup_logger() -> logging.Logger:
     """Configure application logging"""
-    logger = logging.getLogger("SecurityMonitor")
+    logger = logging.getLogger("KaliSecurityMonitor")
     logger.setLevel(logging.INFO)
     
     formatter = logging.Formatter(
         '%(asctime)s - %(name)s - %(levelname)s - %(message)s')
     
-    # File handler
+    # File handler (ensure log directory exists)
+    os.makedirs(os.path.dirname(Config.LOG_FILE), exist_ok=True)
     file_handler = logging.FileHandler(Config.LOG_FILE)
     file_handler.setFormatter(formatter)
     
@@ -79,9 +62,6 @@ def setup_logger() -> logging.Logger:
     
     logger.addHandler(file_handler)
     logger.addHandler(console_handler)
-    
-    # Suppress Scapy warnings
-    logging.getLogger("scapy.runtime").setLevel(logging.ERROR)
     
     return logger
 
@@ -93,31 +73,18 @@ class NetworkMonitor:
         self.running = False
         self.packet_count = 0
         self.detected_threats: List[Dict[str, Any]] = []
-        self.interfaces = self._get_network_interfaces()
+        self.interface = self._validate_interface(Config.INTERFACE)
         self.lock = threading.Lock()
         self.sniffer_thread: Optional[threading.Thread] = None
 
-    def _get_network_interfaces(self) -> List[Dict[str, str]]:
-        """Get active network interfaces with IP addresses"""
-        interfaces = []
-        try:
-            for name, addrs in psutil.net_if_addrs().items():
-                for addr in addrs:
-                    if addr.family == socket.AF_INET:
-                        interfaces.append({
-                            'name': name,
-                            'ip': addr.address,
-                            'netmask': addr.netmask,
-                            'mac': next(
-                                (a.address for a in addrs 
-                                if a.family == psutil.AF_LINK), 
-                                '')
-                        })
-                        break
-            logger.info(f"Found {len(interfaces)} network interfaces")
-        except Exception as e:
-            logger.error(f"Interface detection failed: {e}")
-        return interfaces
+    def _validate_interface(self, iface: str) -> str:
+        """Verify the network interface exists"""
+        interfaces = psutil.net_if_addrs().keys()
+        if iface not in interfaces:
+            available = ", ".join(interfaces)
+            logger.warning(f"Interface {iface} not found. Available: {available}")
+            return next(iter(interfaces), "")  # Use first available interface
+        return iface
 
     def _packet_handler(self, packet) -> None:
         """Process network packets and detect threats"""
@@ -127,23 +94,24 @@ class NetworkMonitor:
         self.packet_count += 1
         
         try:
-            if packet.haslayer(scapy.IP) and packet.haslayer(scapy.TCP):
-                ip = packet[scapy.IP]
-                tcp = packet[scapy.TCP]
+            # Using direct socket parsing instead of Scapy for better performance
+            if socket.IP in packet and socket.TCP in packet:
+                ip_src = packet[socket.IP].src
+                ip_dst = packet[socket.IP].dst
+                tcp_dport = packet[socket.TCP].dport
                 
-                if tcp.dport in Config.THREAT_PORTS:
+                if tcp_dport in Config.THREAT_PORTS:
                     threat = {
-                        'type': Config.THREAT_PORTS[tcp.dport],
-                        'source': ip.src,
-                        'destination': ip.dst,
-                        'port': tcp.dport,
+                        'type': Config.THREAT_PORTS[tcp_dport],
+                        'source': ip_src,
+                        'destination': ip_dst,
+                        'port': tcp_dport,
                         'timestamp': datetime.now().isoformat(),
-                        'flags': str(tcp.flags)
+                        'interface': self.interface
                     }
                     
                     with self.lock:
                         self.detected_threats.append(threat)
-                        # Maintain threat list size
                         if len(self.detected_threats) > Config.MAX_THREATS:
                             self.detected_threats.pop(0)
                     
@@ -154,14 +122,6 @@ class NetworkMonitor:
 
     def start(self) -> bool:
         """Start network monitoring"""
-        if not self.interfaces:
-            logger.error("No active network interfaces available")
-            return False
-
-        if self.running:
-            logger.warning("Monitor already running")
-            return True
-
         self.running = True
         self.sniffer_thread = threading.Thread(
             target=self._start_sniffing,
@@ -169,28 +129,29 @@ class NetworkMonitor:
             name="PacketSniffer"
         )
         self.sniffer_thread.start()
-        logger.info(f"Started monitoring on {self.interfaces[0]['name']}")
+        logger.info(f"Started monitoring on {self.interface}")
         return True
 
     def _start_sniffing(self) -> None:
-        """Main packet sniffing loop"""
+        """Main packet sniffing loop using raw sockets"""
         try:
-            scapy.sniff(
-                prn=self._packet_handler,
-                store=False,
-                filter=Config.SNIFF_FILTER,
-                stop_filter=lambda _: not self.running,
-                iface=self.interfaces[0]['name'] if self.interfaces else None
-            )
+            # Create raw socket
+            sniffer = socket.socket(socket.AF_PACKET, socket.SOCK_RAW, socket.ntohs(3))
+            sniffer.bind((self.interface, 0))
+            
+            while self.running:
+                raw_packet = sniffer.recvfrom(65535)
+                self._packet_handler(raw_packet[0])
+                
         except Exception as e:
             logger.error(f"Sniffing error: {e}")
             self.running = False
+        finally:
+            if 'sniffer' in locals():
+                sniffer.close()
 
     def stop(self) -> None:
         """Stop network monitoring"""
-        if not self.running:
-            return
-
         self.running = False
         if self.sniffer_thread:
             self.sniffer_thread.join(timeout=2)
@@ -214,9 +175,9 @@ async def lifespan(app: FastAPI):
         logger.info("Application shutdown complete")
 
 app = FastAPI(
-    title="Cloud Security Monitor",
-    version="3.5",
-    description="Real-time network threat detection system",
+    title="Kali Security Monitor",
+    version="4.0",
+    description="Linux-optimized network threat detection system",
     lifespan=lifespan
 )
 
@@ -228,7 +189,7 @@ async def get_stats():
         'status': 'running',
         'packets_analyzed': app.state.monitor.packet_count,
         'active_threats': len(app.state.monitor.detected_threats),
-        'interfaces': app.state.monitor.interfaces,
+        'interface': app.state.monitor.interface,
         'start_time': datetime.now().isoformat()
     }
 
@@ -250,13 +211,13 @@ async def get_threats(limit: int = 20):
 # --- Main Execution ---
 if __name__ == "__main__":
     try:
-        logger.info("Starting Cloud Security Monitor")
+        logger.info("Starting Kali Security Monitor")
         uvicorn.run(
             app,
             host=Config.API_HOST,
             port=Config.API_PORT,
             log_level="info",
-            reload=True
+            reload=False  # Disable reload in production
         )
     except Exception as e:
         logger.critical(f"Application failed: {e}")
