@@ -1,250 +1,246 @@
 #!/usr/bin/env python3
 """
-Cloud Security Monitor - Kali Linux Complete Version
-Author: Umidc
-Version: 4.1 (With Proper Logging API)
+Kali Linux Ağ Güvenlik İzleyici
+Versiyon: 6.0 (Genişletilmiş)
+Özellikler:
+- Tüm ağ trafiğini izleme
+- Anormal aktiviteleri tespit etme
+- Saldırıları loglama
+- REST API ile yönetim
 """
 
 import os
 import sys
 import logging
-import platform
 import threading
 import socket
-from datetime import datetime
-from contextlib import asynccontextmanager
-from fastapi import FastAPI, HTTPException, Query
-import uvicorn
-from typing import List, Dict, Any, Optional
 import json
+from datetime import datetime
+from typing import List, Dict, Optional
+from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel
+import uvicorn
 import psutil
 
-# --- Configuration ---
+# ===== KONFİGÜRASYON =====
 class Config:
-    LOG_FILE = "/var/log/security_monitor.log"
-    API_HOST = "0.0.0.0"
-    API_PORT = 8000
-    SNIFF_FILTER = "ip"
-    THREAT_PORTS = {
-        22: "SSH Brute Force",
-        21: "FTP Exploit Attempt",
+    LOG_FILE = "/var/log/ag_guvenlik.log"  # Log dosya yolu
+    ALERT_FILE = "/var/log/ag_saldırıları.log"  # Saldırı logları
+    API_HOST = "0.0.0.0"  # API IP
+    API_PORT = 8000  # API Port
+    MAX_LOGS = 10000  # Maksimum log kaydı
+    
+    # Taranacak portlar ve açıklamaları
+    TEHLIKELI_PORTLAR = {
+        22: "SSH Bruteforce",
         23: "Telnet Attack",
-        3389: "RDP Bruteforce",
+        80: "HTTP Exploit",
+        443: "HTTPS Exploit", 
+        3389: "RDP Attack",
         445: "SMB Exploit",
-        1433: "SQL Injection Attempt",
-        3306: "MySQL Attack"
+        1433: "SQL Injection",
+        3306: "MySQL Attack",
+        5900: "VNC Attack",
+        8080: "Web Exploit"
     }
-    MAX_LOGS = 5000  # Maximum logs to keep in memory
 
-# --- Request Models ---
-class SecurityLog(BaseModel):
-    source_ip: str
-    event_type: str
-    severity: int
-    user: Optional[str] = None
-    details: Optional[Dict] = None
+# ===== VERİ MODELLERİ =====
+class SaldiriLogu(BaseModel):
+    kaynak_ip: str
+    hedef_ip: str
+    port: int
+    saldiri_turu: str
+    zaman: str
+    ek_bilgiler: Optional[Dict] = None
 
-# --- Linux Privilege Check ---
-if platform.system() == 'Linux':
-    if os.geteuid() != 0:
-        print("ERROR: This application requires root privileges!", file=sys.stderr)
+# ===== LOG AYARLARI =====
+def log_ayarlari():
+    """Loglama sistemini kurar"""
+    try:
+        os.makedirs(os.path.dirname(Config.LOG_FILE), exist_ok=True)
+        
+        logger = logging.getLogger("AgGuvenlik")
+        logger.setLevel(logging.INFO)
+        
+        formatter = logging.Formatter(
+            '%(asctime)s - %(name)s - %(levelname)s - %(message)s'
+        )
+        
+        # Dosya handler
+        file_handler = logging.FileHandler(Config.LOG_FILE)
+        file_handler.setFormatter(formatter)
+        
+        # Konsol handler
+        console_handler = logging.StreamHandler()
+        console_handler.setFormatter(formatter)
+        
+        logger.addHandler(file_handler)
+        logger.addHandler(console_handler)
+        
+        return logger
+    except Exception as e:
+        print(f"Log ayarları yapılamadı: {e}")
         sys.exit(1)
 
-# --- Logging Setup ---
-def setup_logger() -> logging.Logger:
-    """Configure application logging"""
-    logger = logging.getLogger("KaliSecurityMonitor")
-    logger.setLevel(logging.INFO)
-    
-    formatter = logging.Formatter(
-        '%(asctime)s - %(name)s - %(levelname)s - %(message)s')
-    
-    # Ensure log directory exists
-    os.makedirs(os.path.dirname(Config.LOG_FILE), exist_ok=True)
-    
-    # File handler
-    file_handler = logging.FileHandler(Config.LOG_FILE)
-    file_handler.setFormatter(formatter)
-    
-    # Console handler
-    console_handler = logging.StreamHandler()
-    console_handler.setFormatter(formatter)
-    
-    logger.addHandler(file_handler)
-    logger.addHandler(console_handler)
-    
-    return logger
+logger = log_ayarlari()
 
-logger = setup_logger()
-
-# --- Security Log Manager ---
-class SecurityLogManager:
+# ===== AĞ İZLEME SİSTEMİ =====
+class AgIzleyici:
     def __init__(self):
-        self.logs: List[Dict] = []
-        self.lock = threading.Lock()
-    
-    def add_log(self, log_data: Dict) -> None:
-        """Add a new security log"""
-        log_entry = {
-            **log_data,
-            "timestamp": datetime.now().isoformat()
-        }
+        self.calisiyor = False
+        self.loglar = []
+        self.kilit = threading.Lock()
+        self.interface = self._ag_arayuzu_sec()
+        self.sniffer_thread = None
         
-        with self.lock:
-            self.logs.append(log_entry)
-            if len(self.logs) > Config.MAX_LOGS:
-                self.logs.pop(0)
-        
-        logger.info(f"New security event: {log_entry}")
-
-    def get_logs(self, limit: int = 100) -> List[Dict]:
-        """Get security logs with limit"""
-        with self.lock:
-            return self.logs[-limit:]
-
-# --- Network Monitor Implementation ---
-class NetworkMonitor:
-    def __init__(self, log_manager: SecurityLogManager):
-        self.running = False
-        self.log_manager = log_manager
-        self.interface = self._get_default_interface()
-        self.sniffer_thread: Optional[threading.Thread] = None
-
-    def _get_default_interface(self) -> str:
-        """Get default network interface"""
-        interfaces = psutil.net_if_addrs().keys()
-        return next(iter(interfaces), "eth0")
-
-    def _packet_handler(self, raw_packet) -> None:
-        """Process network packets"""
+    def _ag_arayuzu_sec(self) -> str:
+        """Ağ arayüzünü otomatik seçer"""
         try:
-            # Basic packet parsing (replace with your actual parsing logic)
-            if b"HTTP" in raw_packet:
-                self.log_manager.add_log({
-                    "source_ip": "detected",
-                    "event_type": "HTTP Traffic",
-                    "severity": 1,
-                    "details": {"packet": str(raw_packet[:100])}
-                })
-                
+            arayuzler = psutil.net_if_addrs()
+            # eth0, wlan0 gibi fiziksel arayüzlere öncelik ver
+            for arayuz in ["eth0", "wlan0", "enp0s3"]:
+                if arayuz in arayuzler:
+                    return arayuz
+            return list(arayuzler.keys())[0]  # Yoksa ilk arayüzü seç
         except Exception as e:
-            logger.error(f"Packet processing error: {e}")
+            logger.error(f"Ağ arayüzü seçilemedi: {e}")
+            return "eth0"  # Varsayılan
+    
+    def _paket_analiz(self, raw_packet) -> Optional[Dict]:
+        """Ham paketleri analiz eder"""
+        try:
+            # Basit bir IP paket analizi (gerçekte daha kompleks olmalı)
+            if len(raw_packet) > 20:  # Minimum IP paket boyutu
+                # Kaynak ve hedef IP'leri çek (basitleştirilmiş)
+                src_ip = ".".join(str(x) for x in raw_packet[12:16])
+                dst_ip = ".".join(str(x) for x in raw_packet[16:20])
+                
+                # TCP/UDP portlarını kontrol et
+                if raw_packet[9] == 6:  # TCP protokolü
+                    src_port = int.from_bytes(raw_packet[20:22], 'big')
+                    dst_port = int.from_bytes(raw_packet[22:24], 'big')
+                    
+                    # Tehlikeli port kontrolü
+                    if dst_port in Config.TEHLIKELI_PORTLAR:
+                        return {
+                            "kaynak_ip": src_ip,
+                            "hedef_ip": dst_ip,
+                            "port": dst_port,
+                            "saldiri_turu": Config.TEHLIKELI_PORTLAR[dst_port],
+                            "zaman": datetime.now().isoformat(),
+                            "paket_boyutu": len(raw_packet)
+                        }
+                        
+        except Exception as e:
+            logger.error(f"Paket analiz hatası: {e}")
+        return None
 
-    def start(self) -> bool:
-        """Start network monitoring"""
-        self.running = True
+    def _saldiri_kaydet(self, saldiri: Dict):
+        """Saldırıyı loglara kaydeder"""
+        with self.kilit:
+            self.loglar.append(saldiri)
+            if len(self.loglar) > Config.MAX_LOGS:
+                self.loglar.pop(0)
+        
+        # Log dosyasına yaz
+        with open(Config.ALERT_FILE, "a") as f:
+            f.write(json.dumps(saldiri) + "\n")
+        
+        logger.warning(f"SALDIRI TESPİT EDİLDİ: {saldiri}")
+
+    def _paket_yakala(self):
+        """Paket yakalama ana döngüsü"""
+        try:
+            sock = socket.socket(socket.AF_PACKET, socket.SOCK_RAW, socket.ntohs(3))
+            sock.bind((self.interface, 0))
+            
+            logger.info(f"{self.interface} arayüzünde paket yakalama başladı...")
+            
+            while self.calisiyor:
+                raw_packet, _ = sock.recvfrom(65535)
+                if saldiri := self._paket_analiz(raw_packet):
+                    self._saldiri_kaydet(saldiri)
+                    
+        except Exception as e:
+            logger.critical(f"Paket yakalama hatası: {e}")
+        finally:
+            sock.close()
+
+    def izlemeyi_baslat(self):
+        """İzlemeyi başlatır"""
+        if self.calisiyor:
+            return False
+            
+        self.calisiyor = True
         self.sniffer_thread = threading.Thread(
-            target=self._start_sniffing,
-            daemon=True,
-            name="PacketSniffer"
+            target=self._paket_yakala,
+            daemon=True
         )
         self.sniffer_thread.start()
-        logger.info(f"Started monitoring on {self.interface}")
         return True
 
-    def _start_sniffing(self) -> None:
-        """Main packet sniffing loop"""
-        try:
-            sniffer = socket.socket(socket.AF_PACKET, socket.SOCK_RAW, socket.ntohs(3))
-            sniffer.bind((self.interface, 0))
-            
-            while self.running:
-                raw_packet = sniffer.recvfrom(65535)
-                self._packet_handler(raw_packet[0])
-                
-        except Exception as e:
-            logger.error(f"Sniffing error: {e}")
-        finally:
-            if 'sniffer' in locals():
-                sniffer.close()
-
-    def stop(self) -> None:
-        """Stop network monitoring"""
-        self.running = False
+    def izlemeyi_durdur(self):
+        """İzlemeyi durdurur"""
+        self.calisiyor = False
         if self.sniffer_thread:
             self.sniffer_thread.join(timeout=2)
-        logger.info("Monitoring stopped")
+        logger.info("İzleme durduruldu")
 
-# --- FastAPI Application ---
-@asynccontextmanager
-async def lifespan(app: FastAPI):
-    """Application lifecycle management"""
-    log_manager = SecurityLogManager()
-    monitor = NetworkMonitor(log_manager)
-    
-    app.state.log_manager = log_manager
-    app.state.monitor = monitor
-    
-    if not monitor.start():
-        raise RuntimeError("Failed to start network monitoring")
-    
-    logger.info("Application started")
-    
-    try:
-        yield
-    finally:
-        monitor.stop()
-        logger.info("Application shutdown complete")
-
+# ===== API SUNUCUSU =====
 app = FastAPI(
-    title="Kali Security Monitor API",
-    version="4.1",
-    description="Complete security monitoring solution for Kali Linux",
-    lifespan=lifespan
+    title="Ağ Güvenlik API",
+    description="Gerçek zamanlı ağ saldırı izleme sistemi"
 )
 
-# --- API Endpoints ---
-@app.post("/api/v1/security/logs", status_code=201)
-async def create_security_log(
-    source_ip: str = Query(..., description="Source IP address"),
-    event_type: str = Query(..., description="Type of security event"),
-    severity: int = Query(..., ge=1, le=10, description="Severity level (1-10)"),
-    payload: SecurityLog = None
-):
-    """Create a new security log entry"""
-    log_data = {
-        "source_ip": source_ip,
-        "event_type": event_type,
-        "severity": severity,
-        "user": payload.user if payload else None,
-        "details": payload.details if payload else None
-    }
+izleyici = AgIzleyici()
+
+@app.on_event("startup")
+async def baslangic():
+    if not izleyici.izlemeyi_baslat():
+        logger.error("İzleme başlatılamadı!")
+        sys.exit(1)
+
+@app.on_event("shutdown")
+async def kapanis():
+    izleyici.izlemeyi_durdur()
+
+@app.get("/api/v1/saldirilar")
+async def saldirilari_getir(limit: int = 100):
+    """Son saldırıları listeler"""
+    if limit < 1 or limit > 1000:
+        raise HTTPException(400, "Limit 1-1000 arasında olmalı")
     
-    app.state.log_manager.add_log(log_data)
-    return {"status": "success", "message": "Log created"}
+    with izleyici.kilit:
+        return {
+            "toplam": len(izleyici.loglar),
+            "saldirilar": izleyici.loglar[-limit:]
+        }
 
-@app.get("/api/v1/security/logs")
-async def get_security_logs(
-    limit: int = Query(100, ge=1, le=1000, description="Number of logs to return")
-):
-    """Get security logs"""
-    logs = app.state.log_manager.get_logs(limit)
+@app.get("/api/v1/durum")
+async def sistem_durumu():
+    """Sistem durumunu gösterir"""
     return {
-        "count": len(logs),
-        "logs": logs
+        "durum": "çalışıyor" if izleyici.calisiyor else "durduruldu",
+        "arayuz": izleyici.interface,
+        "tespit_edilen_saldirilar": len(izleyici.loglar),
+        "son_saldiri": izleyici.loglar[-1] if izleyici.loglar else None
     }
 
-@app.get("/stats")
-async def get_stats():
-    """Get monitoring statistics"""
-    return {
-        "status": "running",
-        "interface": app.state.monitor.interface,
-        "log_count": len(app.state.log_manager.logs)
-    }
-
-# --- Main Execution ---
+# ===== ANA ÇALIŞTIRMA =====
 if __name__ == "__main__":
     try:
-        logger.info("Starting Kali Security Monitor API")
+        # Root kontrolü
+        if os.geteuid() != 0:
+            logger.error("Bu uygulama root yetkisi gerektirir!")
+            sys.exit(1)
+            
+        logger.info("Ağ güvenlik izleyici başlatılıyor...")
         uvicorn.run(
             app,
             host=Config.API_HOST,
             port=Config.API_PORT,
-            log_level="info",
-            reload=False
+            log_level="info"
         )
     except Exception as e:
-        logger.critical(f"Application failed: {e}")
+        logger.critical(f"Kritik hata: {e}")
         sys.exit(1)
